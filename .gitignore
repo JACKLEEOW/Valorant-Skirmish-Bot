@@ -1,0 +1,6 @@
+# Security
+.env
+
+# Python Junk
+__pycache__/
+*.pyc
