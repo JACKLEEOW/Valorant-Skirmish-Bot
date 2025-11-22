@@ -9,16 +9,12 @@ import random
 load_dotenv()
 
 # --- CONFIGURATION ---
-GUILD_ID = 1441629762543026260 # paste your server id here if you are using it for your own
+GUILD_ID = 1441629762543026260 # paste your own id here if you are using the bot for a personal server!!
 
 # --- DATA STRUCTURES ---
-
-
 panel_queues = {} 
-
-# Global Player Lock (Prevents playing in 2 instances at once)
-# {user_id: "QUEUE:msg_id" OR "MATCH:msg_id"}
 player_status = {} 
+#originally had a huge global queue, but had to change to allow multiple instances of panels
 
 class Bot(commands.Bot):
     def __init__(self):
@@ -41,7 +37,6 @@ bot = Bot()
 # --- HELPER FUNCTIONS ---
 
 def get_queue_embed(message_id):
-    """Generates the embed for a SPECIFIC panel instance."""
     if message_id not in panel_queues:
         return discord.Embed(title="Session Expired", description="Please run /setup again.")
 
@@ -53,13 +48,11 @@ def get_queue_embed(message_id):
         color=discord.Color.from_rgb(255, 70, 85)
     )
     
-    # 1. Show Queues
     for mode in ["1v1", "2v2", "3v3"]:
         players = data.get(mode, [])
         player_list = "\n".join([f"> 👤 {p.display_name}" for p in players]) if players else "*Waiting for players...*"
         embed.add_field(name=f"**{mode} Queue** ({len(players)})", value=player_list, inline=False)
 
-    # 2. Show Matches (Only for THIS panel)
     active_matches = data.get("matches", {})
     if active_matches:
         match_text = ""
@@ -74,7 +67,6 @@ def get_queue_embed(message_id):
     return embed
 
 async def refresh_panel(message_id):
-    """Forces the setup panel to redraw itself."""
     if message_id not in panel_queues: return
 
     channel_id = panel_queues[message_id]["channel_id"]
@@ -96,7 +88,6 @@ class QueueView(discord.ui.View):
         user = interaction.user
         msg_id = interaction.message.id
 
-        # 1. GLOBAL CHECK
         if user.id in player_status:
             status = player_status[user.id]
             if status.startswith("MATCH"):
@@ -108,34 +99,26 @@ class QueueView(discord.ui.View):
             return
 
         if msg_id not in panel_queues:
-            # Restore data if missing (bot restart safety)
             panel_queues[msg_id] = {"channel_id": interaction.channel_id, "1v1": [], "2v2": [], "3v3": [], "matches": {}}
 
-        # 2. Check specific queue
         if user in panel_queues[msg_id][mode]:
             await interaction.response.send_message("You are already in this queue.", ephemeral=True)
             return
 
-        # 3. Swap queues
         for q_mode in ["1v1", "2v2", "3v3"]:
             if user in panel_queues[msg_id][q_mode]:
                 panel_queues[msg_id][q_mode].remove(user)
 
-        # 4. Add
         panel_queues[msg_id][mode].append(user)
         player_status[user.id] = f"QUEUE:{msg_id}"
         
-        # 5. Check Start
         required = {"1v1": 2, "2v2": 4, "3v3": 6}
         
         if len(panel_queues[msg_id][mode]) >= required[mode]:
             players = panel_queues[msg_id][mode][:required[mode]]
             panel_queues[msg_id][mode] = panel_queues[msg_id][mode][required[mode]:] 
             
-            # Update UI immediately
             await interaction.response.edit_message(embed=get_queue_embed(msg_id), view=self)
-            
-            # Start Game
             await start_lobby_process(interaction.guild, players, mode, msg_id)
         else:
             await interaction.response.edit_message(embed=get_queue_embed(msg_id), view=self)
@@ -259,7 +242,6 @@ async def start_draft(guild, players, origin_msg_id):
     cap_a = players.pop(0)
     cap_b = players.pop(0)
     
-    # Update status to DRAFTING
     for p in players + [cap_a, cap_b]:
         player_status[p.id] = f"MATCH:{origin_msg_id}" 
 
@@ -274,10 +256,12 @@ async def start_draft(guild, players, origin_msg_id):
 # --- RESULTS & CLEANUP ---
 
 class MatchResultView(discord.ui.View):
-    def __init__(self, team_a_ids, team_b_ids, channel, category, match_id, origin_msg_id):
+    def __init__(self, team_a, team_b, channel, category, match_id, origin_msg_id):
         super().__init__(timeout=None)
-        self.team_a_ids = team_a_ids
-        self.team_b_ids = team_b_ids
+        self.team_a_ids = [m.id for m in team_a] 
+        self.team_b_ids = [m.id for m in team_b]
+        self.cap_a_name = team_a[0].display_name
+        self.cap_b_name = team_b[0].display_name
         self.channel = channel
         self.category = category
         self.match_id = match_id
@@ -288,14 +272,20 @@ class MatchResultView(discord.ui.View):
         if interaction.user.id not in self.team_a_ids + self.team_b_ids:
             await interaction.response.send_message("You are not in this match.", ephemeral=True)
             return
+        
         self.votes[interaction.user.id] = winner
         await interaction.response.send_message(f"You voted for Team {winner}", ephemeral=True)
         
         votes_a = [v for k,v in self.votes.items() if k in self.team_a_ids]
         votes_b = [v for k,v in self.votes.items() if k in self.team_b_ids]
         
-        if votes_a and votes_b: 
-            if votes_a[0] == votes_b[0]: 
+        # Check if both teams have cast at least one vote
+        if votes_a and votes_b:
+            # DISPUTE LOGIC: They disagree
+            if votes_a[0] != votes_b[0]:
+                await self.end_match("DISPUTE")
+            # CONSENSUS LOGIC: They agree
+            elif votes_a[0] == votes_b[0]: 
                 await self.end_match(votes_a[0])
 
     @discord.ui.button(label="Blue Team Won", style=discord.ButtonStyle.primary)
@@ -306,37 +296,59 @@ class MatchResultView(discord.ui.View):
     async def red_win(self, interaction, button):
         await self.handle_vote(interaction, "Red")
 
-    async def end_match(self, winner):
-        self.stop()
+    async def end_match(self, winner_team):
+        self.stop() # Disable buttons
         
-        # 1. Remove from Panel Matches
+        # 1. ANNOUNCEMENT LOGIC
         if self.origin_msg_id in panel_queues:
+            # Remove match from active list
             if self.match_id in panel_queues[self.origin_msg_id]["matches"]:
                 del panel_queues[self.origin_msg_id]["matches"][self.match_id]
-        
+
+            # Logic for Public Announcement
+            channel_id = panel_queues[self.origin_msg_id]["channel_id"]
+            public_channel = bot.get_channel(channel_id)
+            
+            if winner_team == "DISPUTE":
+                # Warn the lobby only
+                await self.channel.send("⚠️ **There is a dispute in votes.** Please alert an admin if issues persist.\nChannels closing...")
+                # No public announcement
+            else:
+                # Publicly announce the winner
+                winning_captain = self.cap_a_name if winner_team == "Blue" else self.cap_b_name
+                if public_channel:
+                    await public_channel.send(f"🏆 **Winner of Match: ⚔️ {self.match_id} is Team 👑 {winning_captain}!**")
+                
+                # Confirm closure in lobby
+                await self.channel.send(f"✅ Match Verified! Deleting channels in 10 seconds...")
+
         # 2. Free Players
         for uid in self.team_a_ids + self.team_b_ids:
             if uid in player_status: del player_status[uid]
 
-        # 3. REFRESH THE DASHBOARD (This fixes your bug!)
+        # 3. Refresh Dashboard
         await refresh_panel(self.origin_msg_id)
 
-        await self.channel.send(f"🏆 **Winner Confirmed: Team {winner}!**\nDeleting channels in 10 seconds...")
+        # 4. Cleanup Channels
         await asyncio.sleep(10)
-        for channel in self.category.channels: await channel.delete()
-        await self.category.delete()
+        for channel in self.category.channels: 
+            try:
+                await channel.delete()
+            except:
+                pass # Ignore errors if already deleted
+        try:
+            await self.category.delete()
+        except:
+            pass
 
 async def setup_match_channels(guild, team_a, team_b, mode, origin_msg_id):
     match_id = random.randint(1000, 9999)
     
-    # Store match in the specific panel
     if origin_msg_id in panel_queues:
         panel_queues[origin_msg_id]["matches"][match_id] = {'blue': team_a, 'red': team_b}
     
-    # Update Status
     for p in team_a + team_b: player_status[p.id] = f"MATCH:{origin_msg_id}"
     
-    # Refresh Panel to show "Match in Progress"
     await refresh_panel(origin_msg_id)
 
     overwrites_a = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
@@ -357,7 +369,7 @@ async def setup_match_channels(guild, team_a, team_b, mode, origin_msg_id):
     embed.add_field(name="🔵 Team Blue", value=blue_list, inline=True)
     embed.add_field(name="🔴 Team Red", value=red_list, inline=True)
     
-    view = MatchResultView([m.id for m in team_a], [m.id for m in team_b], text_chan, category, match_id, origin_msg_id)
+    view = MatchResultView(team_a, team_b, text_chan, category, match_id, origin_msg_id)
     await text_chan.send(embed=embed, view=view)
 
 # --- COMMANDS ---
@@ -369,7 +381,6 @@ async def setup(interaction: discord.Interaction):
     
     msg = await interaction.channel.send(embed=discord.Embed(title="Initializing..."), view=QueueView())
     
-    # Init data for this specific panel
     panel_queues[msg.id] = {
         "channel_id": interaction.channel_id, 
         "1v1": [], "2v2": [], "3v3": [], 
