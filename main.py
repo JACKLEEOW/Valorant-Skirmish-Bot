@@ -15,7 +15,8 @@ GUILD_ID = 1441629762543026260 # paste your own id here if you are using the bot
 panel_queues = {} 
 player_status = {} 
 #originally had a huge global queue, but had to change to allow multiple instances of panels
-
+# Global Player Lock (Prevents playing in 2 instances at once)
+# {user_id: "QUEUE:msg_id" OR "MATCH:msg_id"}
 class Bot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -35,7 +36,7 @@ class Bot(commands.Bot):
 bot = Bot()
 
 # --- HELPER FUNCTIONS ---
-
+#Generates the embed for a specific panel instance.
 def get_queue_embed(message_id):
     if message_id not in panel_queues:
         return discord.Embed(title="Session Expired", description="Please run /setup again.")
@@ -47,12 +48,12 @@ def get_queue_embed(message_id):
         description="Click a button to join a queue.", 
         color=discord.Color.from_rgb(255, 70, 85)
     )
-    
+    # 1. Show Queues
     for mode in ["1v1", "2v2", "3v3"]:
         players = data.get(mode, [])
         player_list = "\n".join([f"> 👤 {p.display_name}" for p in players]) if players else "*Waiting for players...*"
         embed.add_field(name=f"**{mode} Queue** ({len(players)})", value=player_list, inline=False)
-
+    # 2. Show Matches (Only for THIS panel)
     active_matches = data.get("matches", {})
     if active_matches:
         match_text = ""
@@ -67,6 +68,7 @@ def get_queue_embed(message_id):
     return embed
 
 async def refresh_panel(message_id):
+    #Forces the setup panel to redraw itself.
     if message_id not in panel_queues: return
 
     channel_id = panel_queues[message_id]["channel_id"]
@@ -97,7 +99,7 @@ class QueueView(discord.ui.View):
             else:
                  await interaction.response.send_message("You are already in this queue.", ephemeral=True)
             return
-
+        
         if msg_id not in panel_queues:
             panel_queues[msg_id] = {"channel_id": interaction.channel_id, "1v1": [], "2v2": [], "3v3": [], "matches": {}}
 
