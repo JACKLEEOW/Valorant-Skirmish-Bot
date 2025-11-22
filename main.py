@@ -9,11 +9,15 @@ import random
 load_dotenv()
 
 # --- CONFIGURATION ---
-GUILD_ID = 1441629762543026260  # Paste ID if needed
+GUILD_ID = 1441629762543026260 # paste your server id here if you are using it for your own
 
 # --- DATA STRUCTURES ---
+
+
 panel_queues = {} 
-active_games = {} 
+
+# Global Player Lock (Prevents playing in 2 instances at once)
+# {user_id: "QUEUE:msg_id" OR "MATCH:msg_id"}
 player_status = {} 
 
 class Bot(commands.Bot):
@@ -37,32 +41,50 @@ bot = Bot()
 # --- HELPER FUNCTIONS ---
 
 def get_queue_embed(message_id):
+    """Generates the embed for a SPECIFIC panel instance."""
     if message_id not in panel_queues:
-        panel_queues[message_id] = {"1v1": [], "2v2": [], "3v3": []}
+        return discord.Embed(title="Session Expired", description="Please run /setup again.")
 
-    current_queues = panel_queues[message_id]
+    data = panel_queues[message_id]
 
     embed = discord.Embed(
         title="⚔️ Valorant Skirmish Hub", 
-        description="This is a standalone queue instance.\nClick a button to join.", 
+        description="Click a button to join a queue.", 
         color=discord.Color.from_rgb(255, 70, 85)
     )
     
-    for mode, players in current_queues.items():
+    # 1. Show Queues
+    for mode in ["1v1", "2v2", "3v3"]:
+        players = data.get(mode, [])
         player_list = "\n".join([f"> 👤 {p.display_name}" for p in players]) if players else "*Waiting for players...*"
         embed.add_field(name=f"**{mode} Queue** ({len(players)})", value=player_list, inline=False)
 
-    if active_games:
+    # 2. Show Matches (Only for THIS panel)
+    active_matches = data.get("matches", {})
+    if active_matches:
         match_text = ""
-        for m_id, data in active_games.items():
-            blue_team = ", ".join([p.display_name for p in data['blue']])
-            red_team = ", ".join([p.display_name for p in data['red']])
+        for m_id, m_data in active_matches.items():
+            blue_team = ", ".join([p.display_name for p in m_data['blue']])
+            red_team = ", ".join([p.display_name for p in m_data['red']])
             match_text += f"**#{m_id}**: 🔵 `{blue_team}` **VS** 🔴 `{red_team}`\n"
         
         embed.add_field(name="🔥 Matches in Progress", value=match_text, inline=False)
 
     embed.set_footer(text=f"Instance ID: {message_id}")
     return embed
+
+async def refresh_panel(message_id):
+    """Forces the setup panel to redraw itself."""
+    if message_id not in panel_queues: return
+
+    channel_id = panel_queues[message_id]["channel_id"]
+    try:
+        channel = bot.get_channel(channel_id)
+        if channel:
+            msg = channel.get_partial_message(message_id)
+            await msg.edit(embed=get_queue_embed(message_id), view=QueueView())
+    except Exception as e:
+        print(f"Failed to refresh panel {message_id}: {e}")
 
 # --- VIEWS ---
 
@@ -74,56 +96,47 @@ class QueueView(discord.ui.View):
         user = interaction.user
         msg_id = interaction.message.id
 
-        # 1. GLOBAL STATUS CHECK
+        # 1. GLOBAL CHECK
         if user.id in player_status:
             status = player_status[user.id]
-            
-            # Case A: Playing a match (Stored as Integer)
-            if isinstance(status, int): 
-                await interaction.response.send_message(f"❌ You are already playing in Match #{status}!", ephemeral=True)
-                return
-            
-            # Case B: Drafting (Stored as String)
-            if status == "DRAFTING":
-                await interaction.response.send_message("❌ You are currently drafting! Finish that first.", ephemeral=True)
-                return
+            if status.startswith("MATCH"):
+                await interaction.response.send_message(f"❌ You are already playing in a match!", ephemeral=True)
+            elif status != f"QUEUE:{msg_id}":
+                await interaction.response.send_message("❌ You are queued in a different lobby! Leave that one first.", ephemeral=True)
+            else:
+                 await interaction.response.send_message("You are already in this queue.", ephemeral=True)
+            return
 
-            # Case C: Queued in a DIFFERENT panel (Stored as "QUEUE:123...")
-            current_queue_tag = f"QUEUE:{msg_id}"
-            if status != current_queue_tag:
-                 await interaction.response.send_message("❌ You are already queued in a different lobby! Leave that one first.", ephemeral=True)
-                 return
-            
-            # If we get here, they are queued in THIS panel, so we allow them to proceed 
-            # (this allows switching from 1v1 to 2v2 within the same panel)
-
-        # 2. Ensure panel data exists
         if msg_id not in panel_queues:
-            panel_queues[msg_id] = {"1v1": [], "2v2": [], "3v3": []}
+            # Restore data if missing (bot restart safety)
+            panel_queues[msg_id] = {"channel_id": interaction.channel_id, "1v1": [], "2v2": [], "3v3": [], "matches": {}}
 
-        # 3. Check if already in THIS specific queue
+        # 2. Check specific queue
         if user in panel_queues[msg_id][mode]:
             await interaction.response.send_message("You are already in this queue.", ephemeral=True)
             return
 
-        # 4. Clean up old queues (User switching modes in same panel)
-        for q_mode, q_list in panel_queues[msg_id].items():
-            if user in q_list and q_mode != mode:
-                q_list.remove(user)
+        # 3. Swap queues
+        for q_mode in ["1v1", "2v2", "3v3"]:
+            if user in panel_queues[msg_id][q_mode]:
+                panel_queues[msg_id][q_mode].remove(user)
 
-        # 5. Add to queue and Set Status
+        # 4. Add
         panel_queues[msg_id][mode].append(user)
-        player_status[user.id] = f"QUEUE:{msg_id}" # Stored as STRING to prevent confusion
+        player_status[user.id] = f"QUEUE:{msg_id}"
         
-        # 6. Check for Match Start
-        required_players = {"1v1": 2, "2v2": 4, "3v3": 6}
+        # 5. Check Start
+        required = {"1v1": 2, "2v2": 4, "3v3": 6}
         
-        if len(panel_queues[msg_id][mode]) >= required_players[mode]:
-            players = panel_queues[msg_id][mode][:required_players[mode]]
-            panel_queues[msg_id][mode] = panel_queues[msg_id][mode][required_players[mode]:] 
+        if len(panel_queues[msg_id][mode]) >= required[mode]:
+            players = panel_queues[msg_id][mode][:required[mode]]
+            panel_queues[msg_id][mode] = panel_queues[msg_id][mode][required[mode]:] 
             
+            # Update UI immediately
             await interaction.response.edit_message(embed=get_queue_embed(msg_id), view=self)
-            await start_lobby_process(interaction.guild, players, mode)
+            
+            # Start Game
+            await start_lobby_process(interaction.guild, players, mode, msg_id)
         else:
             await interaction.response.edit_message(embed=get_queue_embed(msg_id), view=self)
 
@@ -132,18 +145,17 @@ class QueueView(discord.ui.View):
         msg_id = interaction.message.id
         
         if msg_id not in panel_queues:
-            await interaction.response.send_message("This queue instance has expired.", ephemeral=True)
+            await interaction.response.send_message("Instance not found.", ephemeral=True)
             return
 
         removed = False
-        for mode, q in panel_queues[msg_id].items():
-            if user in q:
-                q.remove(user)
+        for mode in ["1v1", "2v2", "3v3"]:
+            if user in panel_queues[msg_id][mode]:
+                panel_queues[msg_id][mode].remove(user)
                 removed = True
         
         if removed:
-            if user.id in player_status:
-                del player_status[user.id] 
+            if user.id in player_status: del player_status[user.id]
             await interaction.response.edit_message(embed=get_queue_embed(msg_id), view=self)
         else:
             await interaction.response.send_message("You are not in this queue.", ephemeral=True)
@@ -164,19 +176,19 @@ class QueueView(discord.ui.View):
     async def leave_queue(self, interaction, button):
         await self.handle_leave(interaction)
 
-# --- MATCHMAKING LOGIC ---
+# --- MATCHMAKING ---
 
-async def start_lobby_process(guild, players, mode):
+async def start_lobby_process(guild, players, mode, origin_msg_id):
     channel = guild.system_channel or guild.text_channels[0]
     await channel.send(f"🚨 **MATCH FOUND** for {mode}! Prepared: {', '.join([p.mention for p in players])}")
 
     if mode == "1v1":
         random.shuffle(players)
-        await setup_match_channels(guild, [players[0]], [players[1]], mode)
+        await setup_match_channels(guild, [players[0]], [players[1]], mode, origin_msg_id)
     else:
-        await start_draft(guild, players)
+        await start_draft(guild, players, origin_msg_id)
 
-# --- DRAFT SYSTEM ---
+# --- DRAFT ---
 
 class DraftSelect(discord.ui.Select):
     def __init__(self, players, current_captain):
@@ -186,13 +198,13 @@ class DraftSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user != self.current_captain:
-            await interaction.response.send_message("It is not your turn to pick!", ephemeral=True)
+            await interaction.response.send_message("Not your turn!", ephemeral=True)
             return
         picked_id = int(self.values[0])
         await self.view.handle_pick(interaction, picked_id)
 
 class DraftView(discord.ui.View):
-    def __init__(self, captain_a, captain_b, pool):
+    def __init__(self, captain_a, captain_b, pool, origin_msg_id):
         super().__init__(timeout=600)
         self.captain_a = captain_a
         self.captain_b = captain_b
@@ -200,6 +212,7 @@ class DraftView(discord.ui.View):
         self.team_a = [captain_a]
         self.team_b = [captain_b]
         self.turn = "A" 
+        self.origin_msg_id = origin_msg_id
         self.update_components()
 
     def update_components(self):
@@ -211,6 +224,7 @@ class DraftView(discord.ui.View):
     async def handle_pick(self, interaction, picked_id):
         picked_player = next(p for p in self.pool if p.id == picked_id)
         self.pool.remove(picked_player)
+        
         if self.turn == "A":
             self.team_a.append(picked_player)
             self.turn = "B"
@@ -225,11 +239,11 @@ class DraftView(discord.ui.View):
 
         embed = interaction.message.embeds[0]
         if not self.pool:
-            embed.title = "Draft Complete! Setting up lobby..."
+            embed.title = "Draft Complete!"
             embed.color = discord.Color.green()
             embed.description = self.get_roster_text()
             await interaction.response.edit_message(embed=embed, view=None)
-            await setup_match_channels(interaction.guild, self.team_a, self.team_b, "Ranked")
+            await setup_match_channels(interaction.guild, self.team_a, self.team_b, "Ranked", self.origin_msg_id)
         else:
             self.update_components()
             embed.description = self.get_roster_text()
@@ -240,34 +254,34 @@ class DraftView(discord.ui.View):
                 f"**🔴 Team Red (B):** {', '.join([p.display_name for p in self.team_b])}\n\n"
                 f"**Available:** {', '.join([p.display_name for p in self.pool])}")
 
-async def start_draft(guild, players):
+async def start_draft(guild, players, origin_msg_id):
     random.shuffle(players)
     cap_a = players.pop(0)
     cap_b = players.pop(0)
     
-    # Mark as drafting
-    for p in players: player_status[p.id] = "DRAFTING"
-    player_status[cap_a.id] = "DRAFTING"
-    player_status[cap_b.id] = "DRAFTING"
+    # Update status to DRAFTING
+    for p in players + [cap_a, cap_b]:
+        player_status[p.id] = f"MATCH:{origin_msg_id}" 
 
     embed = discord.Embed(title="👨‍✈️ Captain Draft", description="Blue Team Captain picks first.", color=discord.Color.gold())
     embed.add_field(name="Blue Captain", value=cap_a.mention)
     embed.add_field(name="Red Captain", value=cap_b.mention)
-    view = DraftView(cap_a, cap_b, players)
+    view = DraftView(cap_a, cap_b, players, origin_msg_id)
     view.embed_description = view.get_roster_text() 
     channel = guild.system_channel or guild.text_channels[0]
     await channel.send(embed=embed, view=view)
 
-# --- CHANNEL & RESULTS ---
+# --- RESULTS & CLEANUP ---
 
 class MatchResultView(discord.ui.View):
-    def __init__(self, team_a_ids, team_b_ids, channel, category, match_id):
+    def __init__(self, team_a_ids, team_b_ids, channel, category, match_id, origin_msg_id):
         super().__init__(timeout=None)
         self.team_a_ids = team_a_ids
         self.team_b_ids = team_b_ids
         self.channel = channel
         self.category = category
         self.match_id = match_id
+        self.origin_msg_id = origin_msg_id
         self.votes = {}
 
     async def handle_vote(self, interaction, winner):
@@ -294,22 +308,36 @@ class MatchResultView(discord.ui.View):
 
     async def end_match(self, winner):
         self.stop()
-        if self.match_id in active_games: del active_games[self.match_id]
         
+        # 1. Remove from Panel Matches
+        if self.origin_msg_id in panel_queues:
+            if self.match_id in panel_queues[self.origin_msg_id]["matches"]:
+                del panel_queues[self.origin_msg_id]["matches"][self.match_id]
+        
+        # 2. Free Players
         for uid in self.team_a_ids + self.team_b_ids:
             if uid in player_status: del player_status[uid]
+
+        # 3. REFRESH THE DASHBOARD (This fixes your bug!)
+        await refresh_panel(self.origin_msg_id)
 
         await self.channel.send(f"🏆 **Winner Confirmed: Team {winner}!**\nDeleting channels in 10 seconds...")
         await asyncio.sleep(10)
         for channel in self.category.channels: await channel.delete()
         await self.category.delete()
 
-async def setup_match_channels(guild, team_a, team_b, mode):
+async def setup_match_channels(guild, team_a, team_b, mode, origin_msg_id):
     match_id = random.randint(1000, 9999)
-    active_games[match_id] = {'blue': team_a, 'red': team_b}
     
-    # Overwrite status with Match ID (Integer)
-    for p in team_a + team_b: player_status[p.id] = match_id
+    # Store match in the specific panel
+    if origin_msg_id in panel_queues:
+        panel_queues[origin_msg_id]["matches"][match_id] = {'blue': team_a, 'red': team_b}
+    
+    # Update Status
+    for p in team_a + team_b: player_status[p.id] = f"MATCH:{origin_msg_id}"
+    
+    # Refresh Panel to show "Match in Progress"
+    await refresh_panel(origin_msg_id)
 
     overwrites_a = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
     overwrites_b = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
@@ -329,7 +357,7 @@ async def setup_match_channels(guild, team_a, team_b, mode):
     embed.add_field(name="🔵 Team Blue", value=blue_list, inline=True)
     embed.add_field(name="🔴 Team Red", value=red_list, inline=True)
     
-    view = MatchResultView([m.id for m in team_a], [m.id for m in team_b], text_chan, category, match_id)
+    view = MatchResultView([m.id for m in team_a], [m.id for m in team_b], text_chan, category, match_id, origin_msg_id)
     await text_chan.send(embed=embed, view=view)
 
 # --- COMMANDS ---
@@ -337,10 +365,17 @@ async def setup_match_channels(guild, team_a, team_b, mode):
 @bot.tree.command(name="setup", description="Spawns the queue interface")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction):
-    initial_embed = discord.Embed(title="Initializing Queue...", color=discord.Color.light_grey())
     await interaction.response.send_message("Creating queue instance...", ephemeral=True)
-    msg = await interaction.channel.send(embed=initial_embed, view=QueueView())
-    panel_queues[msg.id] = {"1v1": [], "2v2": [], "3v3": []}
+    
+    msg = await interaction.channel.send(embed=discord.Embed(title="Initializing..."), view=QueueView())
+    
+    # Init data for this specific panel
+    panel_queues[msg.id] = {
+        "channel_id": interaction.channel_id, 
+        "1v1": [], "2v2": [], "3v3": [], 
+        "matches": {}
+    }
+    
     await msg.edit(embed=get_queue_embed(msg.id))
 
 # RUN
