@@ -1,0 +1,4 @@
+Setup: 
+Change guild id to your server
+activate venv through running activate.ps1
+run pip install -r requirements.txt
